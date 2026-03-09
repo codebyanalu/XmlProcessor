@@ -4,7 +4,8 @@ from datetime import datetime
 CTK_APPEARANCE = "light"
 CTK_COLOR_THEME = "blue"
 
-PASTA_BASE = r"C:\Users\ana.oliveira\Downloads\Codigos\leitor.xml"
+# Usa o diretório onde o projeto está instalado — funciona independente de acento ou usuário
+PASTA_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(PASTA_BASE, exist_ok=True)
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "leitor_xml_multiusuario")

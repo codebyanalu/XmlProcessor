@@ -92,21 +92,29 @@ def salvar_nfse_csv(registros):
 def total_registros(caminho=CSV_TEMP):
     try:
         if not os.path.exists(caminho): return 0
-        with open(caminho,"r",encoding="utf-8") as f:
-            return max(0, sum(1 for _ in f) - 1)
+        for enc in ("utf-8","utf-8-sig","latin-1"):
+            try:
+                with open(caminho,"r",encoding=enc) as f:
+                    return max(0, sum(1 for _ in f) - 1)
+            except UnicodeDecodeError:
+                continue
+        return 0
     except Exception:
         return 0
 
 def carregar_chaves_nfse():
     chaves = set()
     if not os.path.exists(CSV_NFSE_TEMP): return chaves
-    try:
-        with open(CSV_NFSE_TEMP,"r",encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                chaves.add(f"{row.get('Chave_NFSe','')}_{row.get('Numero_NFSe','')}")
-    except Exception:
-        pass
+    for enc in ("utf-8","utf-8-sig","latin-1"):
+        try:
+            with open(CSV_NFSE_TEMP,"r",encoding=enc) as f:
+                for row in csv.DictReader(f):
+                    chaves.add(f"{row.get('Chave_NFSe','')}_{row.get('Numero_NFSe','')}")
+            return chaves
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
     return chaves
 
 # ── Excel formatado ────────────────────────────────────────────────────────────
@@ -177,11 +185,15 @@ def _df_para_excel(df, caminho, sheet_name, titulo):
     _aplicar_formatacao_excel(caminho, sheet_name, titulo)
 
 def _csv_para_df(caminho, cabecalho):
-    try:
-        df = pd.read_csv(caminho, dtype=str, encoding="utf-8", on_bad_lines="skip")
-    except Exception:
-        df = pd.DataFrame(columns=cabecalho)
-    return df.reindex(columns=cabecalho, fill_value="")
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            df = pd.read_csv(caminho, dtype=str, encoding=enc, on_bad_lines="skip")
+            return df.reindex(columns=cabecalho, fill_value="")
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            break
+    return pd.DataFrame(columns=cabecalho)
 
 def sincronizar_excel_temp():
     if not os.path.exists(CSV_TEMP): return False
@@ -206,26 +218,41 @@ def sincronizar_excel_nfse_temp():
         return False
 
 def atualizar_excel_principal():
+    # Garante que o CSV principal existe antes de gerar Excel
     if not os.path.exists(CSV_PRINCIPAL):
-        return False, "CSV principal não encontrado"
+        _criar_csv_vazio(CSV_PRINCIPAL, CABECALHO_CSV)
     try:
         df = _csv_para_df(CSV_PRINCIPAL, CABECALHO_CSV)
         _df_para_excel(df, EXCEL_PRINCIPAL, "Produtos_NFe",
                        "GCON/SIAN — NF-e — Produtos e Impostos")
-        return True, "Excel NF-e principal atualizado"
+        return True, f"Excel NF-e atualizado ({len(df)} registros)"
     except Exception as e:
         return False, f"Erro Excel NF-e: {e}"
 
 def atualizar_excel_nfse_principal():
+    # Garante que o CSV principal existe antes de gerar Excel
     if not os.path.exists(CSV_NFSE_PRINCIPAL):
-        return False, "CSV NFS-e principal não encontrado"
+        _criar_csv_vazio(CSV_NFSE_PRINCIPAL, CABECALHO_NFSE)
     try:
         df = _csv_para_df(CSV_NFSE_PRINCIPAL, CABECALHO_NFSE)
         _df_para_excel(df, EXCEL_NFSE_PRINCIPAL, "Servicos_NFSe",
                        "GCON/SIAN — NFS-e — Notas de Serviço")
-        return True, "Excel NFS-e principal atualizado"
+        return True, f"Excel NFS-e atualizado ({len(df)} registros)"
     except Exception as e:
         return False, f"Erro Excel NFS-e: {e}"
+
+def salvar_tudo():
+    """Sincroniza temp→principal e regera ambos os Excels. Chame após processar XMLs."""
+    ok1, m1 = sincronizar_com_principal()
+    ok2, m2 = sincronizar_nfse_com_principal()
+    ok3, m3 = atualizar_excel_principal()
+    ok4, m4 = atualizar_excel_nfse_principal()
+    return {
+        "csv_nfe":   (ok1, m1),
+        "csv_nfse":  (ok2, m2),
+        "excel_nfe": (ok3, m3),
+        "excel_nfse":(ok4, m4),
+    }
 
 # ── Sincronização temp → principal ─────────────────────────────────────────────
 
@@ -237,16 +264,25 @@ def _sincronizar_csv(csv_temp, csv_principal, cabecalho, chave_fn):
             return True, "Nenhum dado temporário"
 
         novas = []
-        with open(csv_temp,"r",encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                novas.append(row)
+        for enc in ("utf-8","utf-8-sig","latin-1"):
+            try:
+                with open(csv_temp,"r",encoding=enc) as f:
+                    novas = list(csv.DictReader(f))
+                break
+            except UnicodeDecodeError:
+                continue
         if not novas:
             return True, "Nenhum dado novo"
 
         chaves = set()
-        with open(csv_principal,"r",encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                chaves.add(chave_fn(row))
+        for enc in ("utf-8","utf-8-sig","latin-1"):
+            try:
+                with open(csv_principal,"r",encoding=enc) as f:
+                    for row in csv.DictReader(f):
+                        chaves.add(chave_fn(row))
+                break
+            except UnicodeDecodeError:
+                continue
 
         backup = csv_principal.replace(".csv", f"_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         try: shutil.copy2(csv_principal, backup)

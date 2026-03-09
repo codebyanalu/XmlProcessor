@@ -24,6 +24,7 @@ from load import (
     sincronizar_com_principal, sincronizar_nfse_com_principal,
     atualizar_excel_principal, atualizar_excel_nfse_principal,
     limpar_temporarios, total_registros, carregar_chaves_nfse,
+    salvar_tudo,
 )
 from config.settings import CABECALHO_CSV, CABECALHO_NFSE
 
@@ -71,16 +72,20 @@ def _btn(parent, texto, cmd, bg, hv, **kw):
                      activebackground=hv, activeforeground="white", bd=0, **kw)
 
 def _ler_csv(caminho, cabecalho):
-    """Lê CSV → DataFrame com colunas garantidas. Retorna None se vazio/inexistente."""
+    """Lê CSV → DataFrame com colunas garantidas. Tenta utf-8 e fallback latin-1."""
     if not os.path.exists(caminho):
         return None
-    try:
-        df = pd.read_csv(caminho, dtype=str, encoding="utf-8", on_bad_lines="skip")
-        if df.empty:
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            df = pd.read_csv(caminho, dtype=str, encoding=enc, on_bad_lines="skip")
+            if df.empty:
+                return None
+            return df.reindex(columns=cabecalho, fill_value="")
+        except UnicodeDecodeError:
+            continue
+        except Exception:
             return None
-        return df.reindex(columns=cabecalho, fill_value="")
-    except Exception:
-        return None
+    return None
 
 # ─── Widgets: Treeview ────────────────────────────────────────────────────────
 
@@ -485,6 +490,13 @@ class JanelaPlanilhaNFSe(tk.Toplevel):
 
     def __init__(self, master, df):
         super().__init__(master)
+        # Garante que df é válido
+        if df is None or len(df) == 0:
+            tk.Toplevel.__init__(self, master)
+            self.title("NFS-e — Sem dados")
+            tk.Label(self, text="Nenhuma NFS-e encontrada.\nImporte XMLs de NFS-e primeiro.",
+                     font=("Segoe UI",12), padx=40, pady=40).pack()
+            return
         self.title(f"GCON/SIAN — NFS-e — Planilha  [{len(df)} notas]")
         self.geometry("1800x930"); self.resizable(True, True)
         self.configure(bg=C_FUNDO)
@@ -672,8 +684,11 @@ class AplicacaoLeitorXML:
         self.janela.protocol("WM_DELETE_WINDOW", self._fechar)
         self.janela.grid_columnconfigure(1, weight=1)
         self.janela.grid_rowconfigure(0, weight=1)
-        self.processando = False
-        self.arquivos    = []
+        self.processando  = False
+        self.arquivos     = []
+        self._win_nfe     = None   # referência à janela NF-e aberta
+        self._win_nfse    = None   # referência à janela NFS-e aberta
+        self._win_dash    = None   # referência ao dashboard aberto
 
         locks = verificar_locks_ativos()
         if locks and not messagebox.askyesno("Sessões Ativas",
@@ -852,10 +867,13 @@ class AplicacaoLeitorXML:
         self._ctr(datetime.now().strftime("%d/%m/%Y  %H:%M:%S")); self._div("=")
         self.log("Sistema iniciado. Selecione XMLs para processar.", "ok")
         self.log(f"Pasta compartilhada : {cfg.PASTA_BASE}", "info")
-        nfe_n = total_registros(cfg.CSV_TEMP)
-        nfse_n = total_registros(cfg.CSV_NFSE_TEMP)
-        self.log(f"NF-e na sessão  : {nfe_n} registros", "nfe")
-        self.log(f"NFS-e na sessão : {nfse_n} registros", "nfse")
+        # Mostra contagem: temp (sessão atual) ou principal (sessões anteriores)
+        nfe_n  = total_registros(cfg.CSV_TEMP)      or total_registros(cfg.CSV_PRINCIPAL)
+        nfse_n = total_registros(cfg.CSV_NFSE_TEMP) or total_registros(cfg.CSV_NFSE_PRINCIPAL)
+        orig_nfe  = "sessão" if total_registros(cfg.CSV_TEMP)      else "base"
+        orig_nfse = "sessão" if total_registros(cfg.CSV_NFSE_TEMP) else "base"
+        self.log(f"NF-e  [{orig_nfe}]  : {nfe_n} registros", "nfe")
+        self.log(f"NFS-e [{orig_nfse}] : {nfse_n} registros", "nfse")
         if nfe_n:  self._c_nfe.configure(text=str(nfe_n))
         if nfse_n: self._c_nfse.configure(text=str(nfse_n))
         self.log("")
@@ -942,12 +960,12 @@ class AplicacaoLeitorXML:
         if lote_nfse: salvar_nfse_csv(lote_nfse)
 
         # Excel
-        if sincronizar_excel_temp():
-            self.log("Excel NF-e temp sincronizado.", "ok")
-        else:
-            self.log("Aviso: Excel NF-e não gerado (sem dados ou erro).", "warn")
-        if sincronizar_excel_nfse_temp():
-            self.log("Excel NFS-e temp sincronizado.", "ok")
+        # Gera temporários e salva principal + Excel de uma vez
+        sincronizar_excel_temp()
+        sincronizar_excel_nfse_temp()
+        resultado = salvar_tudo()
+        for chave, (ok, msg) in resultado.items():
+            self.log(f"{chave:12} : {msg}", "ok" if ok else "warn")
 
         # Atualiza cards
         nfe_total = total_registros(cfg.CSV_TEMP)
@@ -970,48 +988,93 @@ class AplicacaoLeitorXML:
                             f"NFS-e: {cnt_nfse} arqs  →  {add_nfse} notas novas\n"
                             + (f"Erros: {err_nfe+err_nfse}" if err_nfe+err_nfse else "Sem erros!"))
 
+        # Recarrega janelas abertas com dados atualizados
+        if self._win_nfe  and self._win_nfe.winfo_exists():
+            self.log("Atualizando janela NF-e…", "info"); self._ver_nfe()
+        if self._win_nfse and self._win_nfse.winfo_exists():
+            self.log("Atualizando janela NFS-e…", "info"); self._ver_nfse()
+        if self._win_dash and self._win_dash.winfo_exists():
+            self.log("Atualizando Dashboard…", "info"); self._ver_dashboard()
+
         self.processando = False; self.arquivos = []
         self._c_arqs.configure(text="0"); self._pv.set(0); self._c_prog.configure(text="0%")
 
     # ─── Visualizações ────────────────────────────────────────────────────────
 
+    def _csv_nfe(self):
+        """Retorna o melhor CSV NF-e disponível: temp (se tiver dados) > principal."""
+        import os
+        for caminho in (cfg.CSV_TEMP, cfg.CSV_PRINCIPAL):
+            if os.path.exists(caminho) and os.path.getsize(caminho) > 200:
+                df = _ler_csv(caminho, CABECALHO_CSV)
+                if df is not None and len(df) > 0:
+                    return caminho
+        return None
+
+    def _csv_nfse(self):
+        """Retorna o melhor CSV NFS-e disponível: temp (se tiver dados) > principal."""
+        import os
+        for caminho in (cfg.CSV_NFSE_TEMP, cfg.CSV_NFSE_PRINCIPAL):
+            if os.path.exists(caminho) and os.path.getsize(caminho) > 200:
+                df = _ler_csv(caminho, CABECALHO_NFSE)
+                if df is not None and len(df) > 0:
+                    return caminho
+        return None
+
     def _ver_nfe(self):
-        # Lê diretamente do CSV temporário — mais confiável que Excel
-        df = _ler_csv(cfg.CSV_TEMP, CABECALHO_CSV)
-        if df is None:
+        # Fecha janela anterior se ainda estiver aberta
+        if self._win_nfe and self._win_nfe.winfo_exists():
+            self._win_nfe.destroy()
+        csv = self._csv_nfe()
+        if csv is None:
             messagebox.showwarning("Aviso", "Nenhum dado NF-e encontrado.\nImporte XMLs de NF-e primeiro."); return
-        JanelaVisualizacaoNFe(self.janela, df)
+        origem = "sessão atual" if csv == cfg.CSV_TEMP else "base principal"
+        self.log(f"Abrindo NF-e de: {origem} ({os.path.basename(csv)})", "info")
+        df = _ler_csv(csv, CABECALHO_CSV)
+        self._win_nfe = JanelaVisualizacaoNFe(self.janela, df)
 
     def _ver_nfse(self):
-        df = _ler_csv(cfg.CSV_NFSE_TEMP, CABECALHO_NFSE)
-        if df is None:
+        if self._win_nfse and self._win_nfse.winfo_exists():
+            self._win_nfse.destroy()
+        csv = self._csv_nfse()
+        if csv is None:
             messagebox.showwarning("Aviso", "Nenhuma NFS-e encontrada.\nImporte XMLs de NFS-e primeiro."); return
-        JanelaPlanilhaNFSe(self.janela, df)
+        origem = "sessão atual" if csv == cfg.CSV_NFSE_TEMP else "base principal"
+        self.log(f"Abrindo NFS-e de: {origem} ({os.path.basename(csv)})", "info")
+        df = _ler_csv(csv, CABECALHO_NFSE)
+        self._win_nfse = JanelaPlanilhaNFSe(self.janela, df)
 
     def _ver_dashboard(self):
-        df_nfse = _ler_csv(cfg.CSV_NFSE_TEMP, CABECALHO_NFSE)
-        df_nfe  = _ler_csv(cfg.CSV_TEMP,      CABECALHO_CSV)
-        if df_nfse is None and df_nfe is None:
+        if self._win_dash and self._win_dash.winfo_exists():
+            self._win_dash.destroy()
+        csv_nfse = self._csv_nfse()
+        csv_nfe  = self._csv_nfe()
+        if csv_nfse is None and csv_nfe is None:
             messagebox.showwarning("Aviso", "Sem dados para exibir.\nImporte XMLs primeiro."); return
-        JanelaDashboard(self.janela, df_nfse, df_nfe)
+        df_nfse = _ler_csv(csv_nfse, CABECALHO_NFSE) if csv_nfse else None
+        df_nfe  = _ler_csv(csv_nfe,  CABECALHO_CSV)  if csv_nfe  else None
+        self._win_dash = JanelaDashboard(self.janela, df_nfse, df_nfe)
 
     def _excel_nfe(self):
-        if not os.path.exists(cfg.CSV_TEMP):
-            messagebox.showwarning("Aviso", "Sem dados. Importe NF-e primeiro."); return
-        sincronizar_excel_temp()
-        if os.path.exists(cfg.EXCEL_TEMP):
-            os.startfile(cfg.EXCEL_TEMP)
-        else:
-            messagebox.showwarning("Aviso", "Excel NF-e não gerado.")
+        csv = self._csv_nfe()
+        if csv is None:
+            messagebox.showwarning("Aviso", "Sem dados NF-e. Importe XMLs primeiro."); return
+        # Gera Excel a partir do melhor CSV disponível
+        from load.storage import _csv_para_df, _df_para_excel
+        df = _csv_para_df(csv, CABECALHO_CSV)
+        _df_para_excel(df, cfg.EXCEL_TEMP, "Produtos_NFe", "GCON/SIAN — NF-e — Produtos e Impostos")
+        self.log(f"Excel NF-e gerado: {len(df)} registros", "ok")
+        os.startfile(cfg.EXCEL_TEMP)
 
     def _excel_nfse(self):
-        if not os.path.exists(cfg.CSV_NFSE_TEMP):
-            messagebox.showwarning("Aviso", "Sem dados. Importe NFS-e primeiro."); return
-        sincronizar_excel_nfse_temp()
-        if os.path.exists(cfg.EXCEL_NFSE_TEMP):
-            os.startfile(cfg.EXCEL_NFSE_TEMP)
-        else:
-            messagebox.showwarning("Aviso", "Excel NFS-e não gerado.")
+        csv = self._csv_nfse()
+        if csv is None:
+            messagebox.showwarning("Aviso", "Sem dados NFS-e. Importe XMLs primeiro."); return
+        from load.storage import _csv_para_df, _df_para_excel
+        df = _csv_para_df(csv, CABECALHO_NFSE)
+        _df_para_excel(df, cfg.EXCEL_NFSE_TEMP, "Servicos_NFSe", "GCON/SIAN — NFS-e — Notas de Serviço")
+        self.log(f"Excel NFS-e gerado: {len(df)} registros", "ok")
+        os.startfile(cfg.EXCEL_NFSE_TEMP)
 
     def _sincronizar(self):
         if self.processando: messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
