@@ -18,7 +18,7 @@ from config.settings import (
     CSV_NFSE_TEMP, EXCEL_NFSE_TEMP,
     CSV_NFSE_PRINCIPAL, EXCEL_NFSE_PRINCIPAL,
     LOCK_FILE, LOCK_TTL_SECONDS,
-    LOG_TEMP, SESSAO_ID, TEMP_DIR, TEMP_TTL_SECONDS, USUARIO_ID,
+    LOG_TEMP, MODO_SESSAO, SESSAO_ID, TEMP_DIR, TEMP_TTL_SECONDS, USUARIO_ID,
 )
 
 # ── Lock / Sessão ──────────────────────────────────────────────────────────────
@@ -42,24 +42,65 @@ def verificar_locks_ativos():
     except Exception:
         return []
 
+def _migrar_csv(caminho, cabecalho):
+    """Garante que o CSV tenha exatamente as colunas do cabecalho atual.
+    Se faltar colunas (versão antiga), reescreve o arquivo com as novas colunas vazias.
+    Retorna True se precisou migrar, False se já estava correto."""
+    if not os.path.exists(caminho) or os.path.getsize(caminho) == 0:
+        return False
+    try:
+        for enc in ("utf-8","utf-8-sig","latin-1"):
+            try:
+                with open(caminho,"r",encoding=enc) as f:
+                    rows = list(csv.DictReader(f))
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return False
+
+        # Verificar se cabeçalho já está correto
+        if rows and set(cabecalho) == set(rows[0].keys()):
+            return False  # já OK, sem migração
+
+        # Migrar: reescrever com novo cabeçalho, preservando dados existentes
+        with open(caminho,"w",newline="",encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=cabecalho, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k,"") for k in cabecalho})
+        return True
+    except Exception:
+        return False
+
 def inicializar_sessao():
     try:
         criar_lock()
-        if os.path.exists(CSV_PRINCIPAL):
-            shutil.copy2(CSV_PRINCIPAL, CSV_TEMP)
-        else:
-            _criar_csv_vazio(CSV_TEMP, CABECALHO_CSV)
 
-        if os.path.exists(CSV_NFSE_PRINCIPAL):
-            shutil.copy2(CSV_NFSE_PRINCIPAL, CSV_NFSE_TEMP)
-        else:
+        if MODO_SESSAO == "substituir":
+            # Começa do zero — temp limpo, sem carregar o histórico
+            _criar_csv_vazio(CSV_TEMP, CABECALHO_CSV)
             _criar_csv_vazio(CSV_NFSE_TEMP, CABECALHO_NFSE)
+        else:
+            # Modo acumular — carrega o histórico do principal para o temp
+            if os.path.exists(CSV_PRINCIPAL):
+                _migrar_csv(CSV_PRINCIPAL, CABECALHO_CSV)
+                shutil.copy2(CSV_PRINCIPAL, CSV_TEMP)
+            else:
+                _criar_csv_vazio(CSV_TEMP, CABECALHO_CSV)
+
+            if os.path.exists(CSV_NFSE_PRINCIPAL):
+                _migrar_csv(CSV_NFSE_PRINCIPAL, CABECALHO_NFSE)
+                shutil.copy2(CSV_NFSE_PRINCIPAL, CSV_NFSE_TEMP)
+            else:
+                _criar_csv_vazio(CSV_NFSE_TEMP, CABECALHO_NFSE)
 
         sincronizar_excel_temp()
 
         with open(LOG_TEMP,"w",encoding="utf-8") as f:
             f.write(f"Sessão: {SESSAO_ID}\nUsuário: {USUARIO_ID}\n"
-                    f"Início: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+                    f"Início: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+                    f"Modo: {MODO_SESSAO}\n")
         return True
     except Exception as e:
         print(f"Erro ao inicializar sessão: {e}")
@@ -241,8 +282,29 @@ def atualizar_excel_nfse_principal():
     except Exception as e:
         return False, f"Erro Excel NFS-e: {e}"
 
+def salvar_excel_sessao():
+    """Após importar XMLs: gera Excel a partir do temp (sessão atual). Não toca no principal."""
+    ok3, m3 = sincronizar_excel_temp()
+    ok4, m4 = sincronizar_excel_nfse_temp()
+    # Copia os Excels temporários para o local do principal (sobrescreve visualmente)
+    resultados = {}
+    for excel_temp, excel_principal, label in [
+        (EXCEL_TEMP,      EXCEL_PRINCIPAL,      "excel_nfe"),
+        (EXCEL_NFSE_TEMP, EXCEL_NFSE_PRINCIPAL, "excel_nfse"),
+    ]:
+        try:
+            if os.path.exists(excel_temp):
+                shutil.copy2(excel_temp, excel_principal)
+                n = len(__import__('pandas').read_excel(excel_principal))
+                resultados[label] = (True, f"Excel atualizado ({n} registros — sessão atual)")
+            else:
+                resultados[label] = (True, "Sem dados para gerar Excel")
+        except Exception as e:
+            resultados[label] = (False, f"Erro Excel: {e}")
+    return resultados
+
 def salvar_tudo():
-    """Sincroniza temp→principal e regera ambos os Excels. Chame após processar XMLs."""
+    """Sincronizar Tudo: temp→principal (substitui) e regera Excel do principal."""
     ok1, m1 = sincronizar_com_principal()
     ok2, m2 = sincronizar_nfse_com_principal()
     ok3, m3 = atualizar_excel_principal()
@@ -258,8 +320,6 @@ def salvar_tudo():
 
 def _sincronizar_csv(csv_temp, csv_principal, cabecalho, chave_fn):
     try:
-        if not os.path.exists(csv_principal):
-            _criar_csv_vazio(csv_principal, cabecalho)
         if not os.path.exists(csv_temp):
             return True, "Nenhum dado temporário"
 
@@ -274,31 +334,49 @@ def _sincronizar_csv(csv_temp, csv_principal, cabecalho, chave_fn):
         if not novas:
             return True, "Nenhum dado novo"
 
-        chaves = set()
-        for enc in ("utf-8","utf-8-sig","latin-1"):
-            try:
-                with open(csv_principal,"r",encoding=enc) as f:
-                    for row in csv.DictReader(f):
-                        chaves.add(chave_fn(row))
-                break
-            except UnicodeDecodeError:
-                continue
+        # Backup do principal antes de qualquer escrita
+        if os.path.exists(csv_principal):
+            nome_backup = os.path.basename(csv_principal).replace(".csv", f"_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            backup = os.path.join(TEMP_DIR, nome_backup)
+            try: shutil.copy2(csv_principal, backup)
+            except Exception: pass
 
-        nome_backup = os.path.basename(csv_principal).replace(".csv", f"_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-        backup = os.path.join(TEMP_DIR, nome_backup)
-        try: shutil.copy2(csv_principal, backup)
-        except Exception: pass
-
-        add = 0
-        with open(csv_principal,"a",newline="",encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=cabecalho, extrasaction="ignore")
-            for row in novas:
-                k = chave_fn(row)
-                if k not in chaves:
+        if MODO_SESSAO == "substituir":
+            # Sobrescreve o principal com exatamente o que veio desta sessão
+            with open(csv_principal,"w",newline="",encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=cabecalho, extrasaction="ignore")
+                writer.writeheader()
+                for row in novas:
                     writer.writerow({c: row.get(c,"") for c in cabecalho})
-                    chaves.add(k)
-                    add += 1
-        return True, f"{add} registro(s) sincronizados"
+            return True, f"{len(novas)} registro(s) salvos (substituição total)"
+
+        else:
+            # Modo acumular — append deduplicado
+            if not os.path.exists(csv_principal):
+                _criar_csv_vazio(csv_principal, cabecalho)
+            _migrar_csv(csv_principal, cabecalho)
+
+            chaves = set()
+            for enc in ("utf-8","utf-8-sig","latin-1"):
+                try:
+                    with open(csv_principal,"r",encoding=enc) as f:
+                        for row in csv.DictReader(f):
+                            chaves.add(chave_fn(row))
+                    break
+                except UnicodeDecodeError:
+                    continue
+
+            add = 0
+            with open(csv_principal,"a",newline="",encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=cabecalho, extrasaction="ignore")
+                for row in novas:
+                    k = chave_fn(row)
+                    if k not in chaves:
+                        writer.writerow({c: row.get(c,"") for c in cabecalho})
+                        chaves.add(k)
+                        add += 1
+            return True, f"{add} registro(s) sincronizados"
+
     except Exception as e:
         return False, f"Erro: {e}"
 

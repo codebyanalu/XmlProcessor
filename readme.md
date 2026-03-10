@@ -13,11 +13,11 @@ Aplicação desktop para leitura em lote de XMLs de **Notas Fiscais Eletrônicas
   - **NFSe Nacional** — padrão SPED/Fazenda (MJOTA, LEXPLAN, Ruber, Stylus, Onfly novo...)
 - Extração de impostos por produto (NF-e): ICMS, IPI, PIS, COFINS, IBS/CBS
 - Extração de impostos por nota (NFS-e): ISS, PIS, COFINS, CSLL, IRRF, INSS, IBS/CBS
-- Deduplicação automática — nunca duplica notas já importadas
 - Planilha interativa com filtro, soma de seleção e exportação CSV
 - Dashboard com gráficos de barras e pizza (sem matplotlib)
 - Múltiplos usuários simultâneos via arquivos temporários isolados por sessão
-- Excel principal atualizado automaticamente após cada importação
+- Excel atualizado automaticamente após cada importação (dados da sessão atual)
+- Botão **Sincronizar Tudo** para salvar a sessão no histórico principal
 
 ---
 
@@ -78,13 +78,24 @@ Criados automaticamente na **pasta do projeto**:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `produtos_nfe.csv` | Todos os produtos NF-e extraídos (acumulado) |
-| `produtos_nfe.xlsx` | Excel formatado NF-e |
-| `servicos_nfse.csv` | Todas as notas NFS-e extraídas (acumulado) |
-| `servicos_nfse.xlsx` | Excel formatado NFS-e |
+| `produtos_nfe.csv` | Histórico NF-e — atualizado apenas ao Sincronizar |
+| `produtos_nfe.xlsx` | Excel NF-e — atualizado a cada importação (sessão atual) |
+| `servicos_nfse.csv` | Histórico NFS-e — atualizado apenas ao Sincronizar |
+| `servicos_nfse.xlsx` | Excel NFS-e — atualizado a cada importação (sessão atual) |
 | `*_backup_*.csv` | Backup automático antes de cada sincronização |
 
 Arquivos temporários ficam em `%TEMP%\leitor_xml_multiusuario\` e são limpos ao fechar.
+
+---
+
+## Modos de sessão
+
+Controlado pelo flag `MODO_SESSAO` em `config/settings.py`:
+
+| Valor | Comportamento |
+|---|---|
+| `"substituir"` *(padrão)* | Cada sessão começa do zero. O Excel mostra só o que foi importado agora. Sincronizar sobrescreve o histórico. |
+| `"acumular"` | Comportamento clássico — cada sessão soma ao histórico. Sincronizar faz append deduplicado. |
 
 ---
 
@@ -99,9 +110,13 @@ XMLs selecionados
        ▼  salvar_produtos_csv() / salvar_nfse_csv()
        │  append no CSV temporário da sessão
        │
-       ▼  salvar_tudo()
-       │  temp → principal (deduplicado por chave)
-       │  CSV principal → Excel principal (formatado)
+       ▼  salvar_excel_sessao()
+       │  temp → Excel principal (só a sessão atual)
+       │  CSV principal NÃO é alterado
+       │
+       ▼  [opcional] Sincronizar Tudo
+       │  temp → CSV principal (substitui ou acumula conforme MODO_SESSAO)
+       │  CSV principal → Excel principal (regerado)
        │
        ▼  planilha / dashboard
           lê sempre o CSV mais recente (temp > principal)
@@ -185,10 +200,13 @@ Get-ChildItem -Path "." -Recurse -Directory -Filter "__pycache__" | Remove-Item 
 
 | Versão | Correção |
 |---|---|
-| atual | `_ler_csv` robusto a CSV com cabeçalho de versão anterior — planilha NFS-e não abre mais vazia após atualizar o sistema |
-| atual | `_csv_nfse()` detecta CSV válido por contagem de linhas, não mais por leitura completa |
-| atual | Bug `tk.Button() got multiple values for keyword argument 'fg'` no botão ✕ do filtro |
-| anterior | Bug tela branca na janela NFS-e — `tk.Toplevel.__init__` chamado duas vezes |
+| atual | Separação entre importar (Excel da sessão) e Sincronizar (salva no histórico) |
+| atual | `_fechar` pergunta se quer sincronizar antes de fechar |
+| atual | `MODO_SESSAO` configurável em `settings.py` (`substituir` / `acumular`) |
+| atual | `_ler_csv` robusto a CSV com cabeçalho de versão anterior |
+| atual | `_csv_nfse()` detecta CSV válido por contagem de linhas |
+| anterior | Bug `tk.Button() got multiple values for keyword argument 'fg'` |
+| anterior | Bug tela branca — `tk.Toplevel.__init__` chamado duas vezes |
 | anterior | Índice hardcoded `[27]` para Valor_Bruto substituído por índice dinâmico |
-| anterior | `IBS_vIBSUF`, `IBS_vIBSMun`, `CBS_vCBS` extraídos de `totCIBS` (não de `valores`) |
+| anterior | `IBS_vIBSUF`, `IBS_vIBSMun`, `CBS_vCBS` extraídos de `totCIBS` |
 | anterior | `cClassTrib` extraído em ambos os formatos (CompNFe e NFSe Nacional) |

@@ -29,6 +29,7 @@ Ele verifica automaticamente versão dos arquivos, dados existentes e dependênc
 9. [Erro de permissão ao executar .ps1](#9-erro-de-permissão-ao-executar-ps1)
 10. [NFS-e Nacional não extrai impostos](#10-nfs-e-nacional-não-extrai-impostos)
 11. [TypeError: got multiple values for keyword argument 'fg'](#11-typeerror-got-multiple-values-for-keyword-argument-fg)
+12. [CSV principal foi apagado / Excel mostra dados antigos após Sincronizar](#12-csv-principal-foi-apagado--excel-mostra-dados-antigos-após-sincronizar)
 
 ---
 
@@ -106,35 +107,44 @@ Get-ChildItem -Path "." -Recurse -Directory -Filter "__pycache__" | Remove-Item 
 ## 3. Excel não atualiza após importar XMLs
 
 ### Comportamento esperado
-A partir da versão atual, o Excel é atualizado **automaticamente** ao final de cada importação. O log mostra:
+A partir da versão atual, o Excel é atualizado **automaticamente após cada importação**, refletindo apenas os dados da sessão atual. O log mostra:
 ```
-excel_nfe    : OK — Excel NF-e atualizado (X registros)
-excel_nfse   : OK — Excel NFS-e atualizado (X registros)
+excel_nfe    : Excel atualizado (X registros — sessão atual)
+excel_nfse   : Excel atualizado (X registros — sessão atual)
 ```
 
-### Se ainda não atualiza
-1. Verifique se o arquivo Excel está **aberto** — o Excel bloqueia escrita enquanto está aberto. Feche o arquivo e reimporte.
-2. Clique em **Sincronizar Tudo** na sidebar para forçar atualização manual.
-3. Verifique se o `main_window.py` está atualizado (o log deve mostrar as 4 linhas de sincronização após processar).
+### Se o Excel não atualiza
+1. Verifique se o arquivo Excel está **aberto** — o Excel bloqueia escrita enquanto está aberto. Feche e reimporte.
+2. Verifique se o `storage.py` está atualizado — deve conter a função `salvar_excel_sessao`.
+3. Limpe o cache e tente novamente:
+```powershell
+Get-ChildItem -Path "." -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+```
+
+### O Excel mostra dados antigos (de sessões anteriores)
+Isso significa que o CSV principal ainda tem dados de sessões anteriores e foi usado para gerar o Excel. Verifique se o `main_window.py` está atualizado — após importar, o log deve mostrar **"sessão atual"**, não **"base principal"**.
 
 ---
 
 ## 4. Nota não aparece após importar
 
-### Causa — deduplicação por chave
-O sistema nunca duplica uma nota já importada. A chave de deduplicação é:
+### Causa A — nota já existia no CSV temporário da sessão
+O sistema não duplica notas dentro da mesma sessão. A chave de deduplicação é:
 
 - **NF-e:** `Chave_NFe + Item + cProd`
 - **NFS-e:** `Chave_NFSe + Numero_NFSe`
 
-Se a nota já estava no CSV principal de uma sessão anterior, ela será ignorada silenciosamente.
+Se você importou o mesmo XML duas vezes na mesma sessão, a segunda é ignorada.
 
-**Como verificar:** procure a chave da nota no CSV principal:
+### Causa B — confusão entre sessão e histórico (modo substituir)
+No modo `substituir` (padrão), o CSV principal só é atualizado ao clicar **Sincronizar**. A planilha e o Excel mostram apenas a sessão atual. Se a nota foi importada em uma sessão anterior e você não sincronizou, ela não aparece.
+
+**Solução:** importe os XMLs novamente na sessão atual e clique em Sincronizar se quiser guardar no histórico.
+
+### Como verificar o histórico salvo
 ```powershell
 Select-String -Path "servicos_nfse.csv" -Pattern "CHAVE_DA_NOTA"
 ```
-
-**Para reimportar uma nota já existente:** delete o CSV principal (`servicos_nfse.csv` ou `produtos_nfe.csv`) e reimporte todos os XMLs. Os backups ficam com sufixo `_backup_DATA.csv`.
 
 ---
 
@@ -276,6 +286,35 @@ Após substituir o arquivo, limpe o cache:
 ```powershell
 Get-ChildItem -Path "." -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 ```
+
+---
+
+## 12. CSV principal foi apagado / Excel mostra dados antigos após Sincronizar
+
+### Sintoma
+Após clicar em Sincronizar, o Excel mostra menos dados do que o esperado, ou mostra dados de uma sessão antiga.
+
+### Causa — modo substituir
+No modo `substituir` (padrão), Sincronizar **sobrescreve** o CSV principal com exatamente o que foi importado na sessão atual. Se você esperava acumular com sessões anteriores, mude o modo:
+
+```python
+# config/settings.py
+MODO_SESSAO = "acumular"
+```
+
+### Recuperar dados de uma sincronização anterior
+Antes de cada sincronização, o sistema cria um backup automático em `%TEMP%\leitor_xml_multiusuario\`:
+```
+produtos_nfe_backup_20260310_143022.csv
+servicos_nfse_backup_20260310_143022.csv
+```
+
+Para restaurar, copie o backup para a pasta do projeto e renomeie:
+```powershell
+Copy-Item "$env:TEMP\leitor_xml_multiusuario\servicos_nfse_backup_*.csv" ".\servicos_nfse.csv"
+```
+
+> Backups são limpos automaticamente após 7 dias.
 
 ---
 

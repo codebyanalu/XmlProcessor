@@ -1,13 +1,7 @@
-#!/usr/bin/env python3
-"""
-main.py — ponto de entrada da aplicação.
-Execute: python main.py
-"""
-
 import sys
 import os
 
-# Garante que o diretório do projeto está no path,
+# Garante que o diretório do projeto está no path
 # independente de onde o script for chamado
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -17,8 +11,8 @@ from config.settings import CTK_APPEARANCE, CTK_COLOR_THEME
 
 def main():
     try:
-        import pandas  # noqa: F401
-        import openpyxl  # noqa: F401
+        import pandas 
+        import openpyxl  
     except ImportError as e:
         print(f"Dependência ausente: {e}")
         print("Instale com:  pip install pandas openpyxl customtkinter")

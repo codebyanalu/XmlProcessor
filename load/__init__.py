@@ -5,5 +5,5 @@ from .storage import (
     sincronizar_com_principal, sincronizar_nfse_com_principal,
     atualizar_excel_principal, atualizar_excel_nfse_principal,
     limpar_temporarios, total_registros, carregar_chaves_nfse,
-    _csv_para_df, _df_para_excel, salvar_tudo,
+    _csv_para_df, _df_para_excel, salvar_tudo, salvar_excel_sessao,
 )

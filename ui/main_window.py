@@ -9,6 +9,7 @@ Correções definitivas:
 """
 
 import math, os, sys, threading, tkinter as tk
+import multiprocessing as mp
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from datetime import datetime
 import customtkinter as ctk
@@ -24,7 +25,7 @@ from load import (
     sincronizar_com_principal, sincronizar_nfse_com_principal,
     atualizar_excel_principal, atualizar_excel_nfse_principal,
     limpar_temporarios, total_registros, carregar_chaves_nfse,
-    salvar_tudo,
+    salvar_tudo, salvar_excel_sessao,
 )
 from config.settings import CABECALHO_CSV, CABECALHO_NFSE
 
@@ -39,7 +40,80 @@ PALETA  = ["#2980b9","#e67e22","#27ae60","#8e44ad",
 FONTE_LOG = ("Consolas", 10)
 LOTE_MAX  = 500
 
-# ─── Utilitários ──────────────────────────────────────────────────────────────
+# ─── Worker de processamento (fora da classe — obrigatório para multiprocessing) ─
+
+def _worker_processar(arquivos, csv_temp, csv_nfse_temp, cabecalho_csv, cabecalho_nfse,
+                      chaves_nfe, chaves_nfse, fila):
+    """Roda em processo separado. Envia eventos para a fila para a UI consumir."""
+    import os, csv as csvmod
+    from extract import extrair_produtos, extrair_servicos
+    from transform import filtrar_novos
+
+    def _tipo(caminho):
+        try:
+            with open(caminho, "r", encoding="utf-8", errors="ignore") as f:
+                t = f.read(600)
+            return "nfse" if any(x in t for x in ["CompNFe","<NFSe","infNFSe","nNFSe"]) else "nfe"
+        except Exception:
+            return "nfe"
+
+    def _salvar(regs, caminho, cabecalho):
+        if not regs: return
+        existe = os.path.exists(caminho) and os.path.getsize(caminho) > 0
+        with open(caminho, "a", newline="", encoding="utf-8") as f:
+            w = csvmod.DictWriter(f, fieldnames=cabecalho, extrasaction="ignore")
+            if not existe: w.writeheader()
+            for r in regs:
+                w.writerow({k: r.get(k, "") for k in cabecalho})
+
+    total = len(arquivos)
+    lote_nfe = []; lote_nfse = []
+    cnt_nfe = cnt_nfse = add_nfe = add_nfse = err_nfe = err_nfse = 0
+
+    for i, arq in enumerate(arquivos, 1):
+        nome = os.path.basename(arq)
+        tipo = _tipo(arq)
+
+        if tipo == "nfse":
+            cnt_nfse += 1
+            regs, msg = extrair_servicos(arq)
+            if msg.startswith("ERRO"):
+                err_nfse += 1
+                fila.put(("log", "err", f"  [{i:>4}/{total}] [NFS-e] ⚠  {nome[:48]}  →  {msg[:50]}"))
+            else:
+                novos = [r for r in regs
+                         if f"{r.get('Chave_NFSe','')}_{r.get('Numero_NFSe','')}" not in chaves_nfse]
+                for r in novos:
+                    chaves_nfse.add(f"{r.get('Chave_NFSe','')}_{r.get('Numero_NFSe','')}")
+                lote_nfse.extend(novos); add_nfse += len(novos)
+                fila.put(("log", "nfse", f"  [{i:>4}/{total}] [NFS-e] {nome[:48]:<50}  {len(novos):>3} novo(s)  [{msg[:30]}]"))
+        else:
+            cnt_nfe += 1
+            regs, msg = extrair_produtos(arq)
+            if msg.startswith("ERRO"):
+                err_nfe += 1
+                fila.put(("log", "err", f"  [{i:>4}/{total}] [NF-e]  ⚠  {nome[:48]}  →  {msg[:50]}"))
+            else:
+                novos, _ = filtrar_novos(regs, chaves_nfe)
+                for r in novos:
+                    chaves_nfe.add(f"{r.get('Chave_NFe','')}_{r.get('Item','')}_{r.get('cProd','')}")
+                lote_nfe.extend(novos); add_nfe += len(novos)
+                fila.put(("log", "nfe", f"  [{i:>4}/{total}] [NF-e]  {nome[:48]:<50}  {len(novos):>3} novo(s)  {len(regs)} itens"))
+
+        # Salva lotes
+        if len(lote_nfe)  >= LOTE_MAX:
+            _salvar(lote_nfe, csv_temp, cabecalho_csv); lote_nfe = []
+        if len(lote_nfse) >= LOTE_MAX:
+            _salvar(lote_nfse, csv_nfse_temp, cabecalho_nfse); lote_nfse = []
+
+        fila.put(("progresso", i, total, cnt_nfe, cnt_nfse))
+
+    # Salva restos
+    _salvar(lote_nfe,  csv_temp,      cabecalho_csv)
+    _salvar(lote_nfse, csv_nfse_temp, cabecalho_nfse)
+    fila.put(("fim", cnt_nfe, cnt_nfse, add_nfe, add_nfse, err_nfe, err_nfse))
+
+
 
 def _detectar_tipo(caminho):
     try:
@@ -709,6 +783,7 @@ class AplicacaoLeitorXML:
         self.janela.grid_columnconfigure(1, weight=1)
         self.janela.grid_rowconfigure(0, weight=1)
         self.processando  = False
+        self.cancelar     = False
         self.arquivos     = []
         self._win_nfe     = None   # referência à janela NF-e aberta
         self._win_nfse    = None   # referência à janela NFS-e aberta
@@ -775,6 +850,7 @@ class AplicacaoLeitorXML:
         tk.Frame(sb, bg=C_SIDE2, height=1).pack(fill="x", padx=16, pady=3)
         sec("SINCRONIZAR")
         sbtn("Sincronizar Tudo", "⟳", self._sincronizar)
+        sbtn("Limpar Sessão",    "⌫", self._limpar_sessao)
         tk.Frame(sb, bg=C_SIDE2, height=1).pack(fill="x", padx=16, pady=3)
         sec("LOG")
         sbtn("Limpar Log", "✕", lambda: [self.txt_log.delete(1.0, tk.END), self.log("Log limpo.", "info")])
@@ -839,6 +915,12 @@ class AplicacaoLeitorXML:
         ctk.CTkProgressBar(pf, variable=self._pv, height=7, corner_radius=4,
                            fg_color=C_BORDA, progress_color=C_SEC).grid(row=0, column=0, sticky="ew")
         self._pv.set(0)
+        self._btn_parar = tk.Button(pf, text="⏹ Parar", font=("Segoe UI",8,"bold"),
+                                    bg=C_ERR, fg="white", relief="flat", bd=0,
+                                    cursor="hand2", padx=8, pady=2,
+                                    command=self._parar_processamento)
+        self._btn_parar.grid(row=0, column=1, padx=(8,0))
+        self._btn_parar.grid_remove()  # oculto por padrão
 
         # Log
         lo = tk.Frame(area, bg=C_F2, highlightbackground=C_BORDA, highlightthickness=1)
@@ -904,28 +986,32 @@ class AplicacaoLeitorXML:
 
     # ─── Seleção e Pipeline ───────────────────────────────────────────────────
 
-    def _sel_um(self):
-        if self.processando: messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
-        arq = filedialog.askopenfilename(title="Selecione um XML",
-                                          filetypes=[("XML","*.xml"),("Todos","*.*")])
-        if arq:
-            self.arquivos = [arq]; self._c_arqs.configure(text="1")
-            threading.Thread(target=self._processar, daemon=True).start()
-
-    def _sel_varios(self):
-        if self.processando: messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
-        arqs = filedialog.askopenfilenames(title="Selecione XMLs",
-                                            filetypes=[("XML","*.xml"),("Todos","*.*")])
-        if arqs:
-            self.arquivos = list(arqs); self._c_arqs.configure(text=str(len(arqs)))
-            threading.Thread(target=self._processar, daemon=True).start()
+    def _parar_processamento(self):
+        if not self.processando: return
+        if not messagebox.askyesno("Parar", "Parar imediatamente e descartar tudo da sessão atual?"):
+            return
+        self.cancelar = True
+        if hasattr(self, "_proc") and self._proc and self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=2)
+        # Zera o temp
+        from load.storage import _criar_csv_vazio
+        _criar_csv_vazio(cfg.CSV_TEMP,      cfg.CABECALHO_CSV)
+        _criar_csv_vazio(cfg.CSV_NFSE_TEMP, cfg.CABECALHO_NFSE)
+        self.processando = False; self.arquivos = []; self.cancelar = False
+        self._c_nfe.configure(text="0"); self._c_nfse.configure(text="0")
+        self._c_status.configure(text="CANCELADO", fg=C_ERR)
+        self._btn_parar.configure(text="⏹ Parar", state="normal")
+        self.janela.after(0, self._btn_parar.grid_remove)
+        self._pv.set(0); self._c_prog.configure(text="0%"); self._c_arqs.configure(text="0")
+        self.log("⏹ Processo encerrado. Sessão zerada — pronto para nova importação.", "warn")
 
     def _processar(self):
         self.processando = True
+        self.cancelar    = False
+        self.janela.after(0, self._btn_parar.grid)
         self._c_status.configure(text="PROCESSANDO...", fg=C_WARN)
         total = len(self.arquivos)
-        cnt_nfe = cnt_nfse = add_nfe = add_nfse = err_nfe = err_nfse = 0
-        lote_nfe = []; lote_nfse = []
 
         self.log(""); self._div("="); self._ctr("INÍCIO DO PROCESSAMENTO"); self._div("=")
         self.log(f"Total de arquivos   : {total}", "info")
@@ -936,63 +1022,58 @@ class AplicacaoLeitorXML:
         chaves_nfe  = carregar_chaves_existentes(cfg.CSV_TEMP)
         chaves_nfse = carregar_chaves_nfse()
 
-        for i, arq in enumerate(self.arquivos, 1):
-            nome = os.path.basename(arq)
-            tipo = _detectar_tipo(arq)
+        fila = mp.Queue()
+        self._proc = mp.Process(
+            target=_worker_processar,
+            args=(self.arquivos, cfg.CSV_TEMP, cfg.CSV_NFSE_TEMP,
+                  cfg.CABECALHO_CSV, cfg.CABECALHO_NFSE,
+                  chaves_nfe, chaves_nfse, fila),
+            daemon=True
+        )
+        self._proc.start()
 
-            if tipo == "nfse":
-                cnt_nfse += 1
-                regs, msg = extrair_servicos(arq)
-                if msg.startswith("ERRO"):
-                    err_nfse += 1
-                    self.log(f"  [{i:>4}/{total}] [NFS-e] ⚠  {nome[:48]}  →  {msg[:50]}", "err")
-                else:
-                    novos = [r for r in regs
-                             if f"{r.get('Chave_NFSe','')}_{r.get('Numero_NFSe','')}" not in chaves_nfse]
-                    for r in novos:
-                        chaves_nfse.add(f"{r.get('Chave_NFSe','')}_{r.get('Numero_NFSe','')}")
-                    lote_nfse.extend(novos); add_nfse += len(novos)
-                    self.log(f"  [{i:>4}/{total}] [NFS-e] {nome[:48]:<50}  {len(novos):>3} novo(s)  [{msg[:30]}]", "nfse")
-            else:
-                cnt_nfe += 1
-                regs, msg = extrair_produtos(arq)
-                if msg.startswith("ERRO"):
-                    err_nfe += 1
-                    self.log(f"  [{i:>4}/{total}] [NF-e]  ⚠  {nome[:48]}  →  {msg[:50]}", "err")
-                else:
-                    novos, _ = filtrar_novos(regs, chaves_nfe)
-                    for r in novos:
-                        chaves_nfe.add(f"{r.get('Chave_NFe','')}_{r.get('Item','')}_{r.get('cProd','')}")
-                    lote_nfe.extend(novos); add_nfe += len(novos)
-                    self.log(f"  [{i:>4}/{total}] [NF-e]  {nome[:48]:<50}  {len(novos):>3} novo(s)  {len(regs)} itens", "nfe")
+        cnt_nfe = cnt_nfse = add_nfe = add_nfse = err_nfe = err_nfse = 0
 
-            # Salva lotes
-            if len(lote_nfe)  >= LOTE_MAX: salvar_produtos_csv(lote_nfe);  lote_nfe  = []
-            if len(lote_nfse) >= LOTE_MAX: salvar_nfse_csv(lote_nfse);     lote_nfse = []
+        while True:
+            if self.cancelar:
+                break
+            try:
+                evento = fila.get(timeout=0.1)
+            except Exception:
+                # fila vazia — verifica se processo terminou
+                if not self._proc.is_alive():
+                    break
+                continue
 
-            # Throttle UI
-            if i % 10 == 0 or i == total:
-                p = i / total
+            tipo = evento[0]
+            if tipo == "log":
+                _, nivel, msg = evento
+                self.log(msg, nivel)
+            elif tipo == "progresso":
+                _, i, tot, cnfe, cnfse = evento
+                cnt_nfe = cnfe; cnt_nfse = cnfse
+                p = i / tot
                 self._pv.set(p); self._c_prog.configure(text=f"{p*100:.0f}%")
                 self._c_proc.configure(text=str(i))
                 self._badge_nfe.configure(text=f"  NF-e: {cnt_nfe}  ")
                 self._badge_nfse.configure(text=f"  NFS-e: {cnt_nfse}  ")
                 self.janela.update_idletasks()
+            elif tipo == "fim":
+                _, cnt_nfe, cnt_nfse, add_nfe, add_nfse, err_nfe, err_nfse = evento
+                break
 
-        # Salva restos
-        if lote_nfe:  salvar_produtos_csv(lote_nfe)
-        if lote_nfse: salvar_nfse_csv(lote_nfse)
+        if self.cancelar:
+            return  # _parar_processamento já fez a limpeza
 
-        # Excel
-        # Gera temporários e salva principal + Excel de uma vez
-        sincronizar_excel_temp()
-        sincronizar_excel_nfse_temp()
-        resultado = salvar_tudo()
+        self._proc.join()
+
+        # Excel da sessão
+        resultado = salvar_excel_sessao()
         for chave, (ok, msg) in resultado.items():
             self.log(f"{chave:12} : {msg}", "ok" if ok else "warn")
 
         # Atualiza cards
-        nfe_total = total_registros(cfg.CSV_TEMP)
+        nfe_total  = total_registros(cfg.CSV_TEMP)
         nfse_total = total_registros(cfg.CSV_NFSE_TEMP)
         self._c_nfe.configure(text=str(nfe_total))
         self._c_nfse.configure(text=str(nfse_total))
@@ -1012,7 +1093,7 @@ class AplicacaoLeitorXML:
                             f"NFS-e: {cnt_nfse} arqs  →  {add_nfse} notas novas\n"
                             + (f"Erros: {err_nfe+err_nfse}" if err_nfe+err_nfse else "Sem erros!"))
 
-        # Recarrega janelas abertas com dados atualizados
+        # Recarrega janelas abertas
         if self._win_nfe  and self._win_nfe.winfo_exists():
             self.log("Atualizando janela NF-e…", "info"); self._ver_nfe()
         if self._win_nfse and self._win_nfse.winfo_exists():
@@ -1020,8 +1101,80 @@ class AplicacaoLeitorXML:
         if self._win_dash and self._win_dash.winfo_exists():
             self.log("Atualizando Dashboard…", "info"); self._ver_dashboard()
 
-        self.processando = False; self.arquivos = []
+        self.processando = False; self.arquivos = []; self.cancelar = False
+        self.janela.after(0, self._btn_parar.grid_remove)
+        self._btn_parar.configure(text="⏹ Parar", state="normal")
         self._c_arqs.configure(text="0"); self._pv.set(0); self._c_prog.configure(text="0%")
+        """Se já houver dados na sessão, pergunta se quer substituir ou adicionar.
+        Retorna True para continuar, False para cancelar."""
+        nfe  = total_registros(cfg.CSV_TEMP)
+        nfse = total_registros(cfg.CSV_NFSE_TEMP)
+        if nfe == 0 and nfse == 0:
+            return True  # sessão vazia — pode importar direto
+        resp = messagebox.askyesnocancel(
+            "Sessão com dados",
+            f"A sessão atual já tem dados:\n\n"
+            f"  NF-e : {nfe} registro(s)\n"
+            f"  NFS-e: {nfse} registro(s)\n\n"
+            f"Sim    → Substituir (zera a sessão e importa os novos)\n"
+            f"Não    → Adicionar (mantém os existentes e acrescenta)\n"
+            f"Cancelar → Voltar"
+        )
+        if resp is None:
+            return False  # Cancelar
+        if resp:  # Sim → zera o temp antes de importar
+            from load.storage import _criar_csv_vazio
+            _criar_csv_vazio(cfg.CSV_TEMP,      cfg.CABECALHO_CSV)
+            _criar_csv_vazio(cfg.CSV_NFSE_TEMP, cfg.CABECALHO_NFSE)
+            self._c_nfe.configure(text="0")
+            self._c_nfse.configure(text="0")
+            self.log("Sessão substituída — dados anteriores removidos.", "warn")
+        return True  # Não → adiciona normalmente
+
+    def _confirmar_sessao(self):
+        """Se já houver dados na sessão, pergunta se quer substituir ou adicionar.
+        Retorna True para continuar, False para cancelar."""
+        nfe  = total_registros(cfg.CSV_TEMP)
+        nfse = total_registros(cfg.CSV_NFSE_TEMP)
+        if nfe == 0 and nfse == 0:
+            return True  # sessão vazia — pode importar direto
+        resp = messagebox.askyesnocancel(
+            "Sessão com dados",
+            f"A sessão atual já tem dados:\n\n"
+            f"  NF-e : {nfe} registro(s)\n"
+            f"  NFS-e: {nfse} registro(s)\n\n"
+            f"Sim    → Substituir (zera a sessão e importa os novos)\n"
+            f"Não    → Adicionar (mantém os existentes e acrescenta)\n"
+            f"Cancelar → Voltar"
+        )
+        if resp is None:
+            return False
+        if resp:
+            from load.storage import _criar_csv_vazio
+            _criar_csv_vazio(cfg.CSV_TEMP,      cfg.CABECALHO_CSV)
+            _criar_csv_vazio(cfg.CSV_NFSE_TEMP, cfg.CABECALHO_NFSE)
+            self._c_nfe.configure(text="0")
+            self._c_nfse.configure(text="0")
+            self.log("Sessão substituída — dados anteriores removidos.", "warn")
+        return True
+
+    def _sel_um(self):
+        if self.processando: messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
+        arq = filedialog.askopenfilename(title="Selecione um XML",
+                                          filetypes=[("XML","*.xml"),("Todos","*.*")])
+        if arq:
+            if not self._confirmar_sessao(): return
+            self.arquivos = [arq]; self._c_arqs.configure(text="1")
+            threading.Thread(target=self._processar, daemon=True).start()
+
+    def _sel_varios(self):
+        if self.processando: messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
+        arqs = filedialog.askopenfilenames(title="Selecione XMLs",
+                                            filetypes=[("XML","*.xml"),("Todos","*.*")])
+        if arqs:
+            if not self._confirmar_sessao(): return
+            self.arquivos = list(arqs); self._c_arqs.configure(text=str(len(arqs)))
+            threading.Thread(target=self._processar, daemon=True).start()
 
     # ─── Visualizações ────────────────────────────────────────────────────────
 
@@ -1115,12 +1268,51 @@ class AplicacaoLeitorXML:
         if ok2: ok4, m4 = atualizar_excel_nfse_principal(); self.log(f"Excel NFS-e: {m4}", "ok" if ok4 else "warn")
         messagebox.showinfo("Sincronização", f"NF-e : {m1}\nNFS-e: {m2}")
 
+    def _limpar_sessao(self):
+        if self.processando:
+            messagebox.showwarning("Aguarde", "Processamento em andamento!"); return
+        nfe  = total_registros(cfg.CSV_TEMP)
+        nfse = total_registros(cfg.CSV_NFSE_TEMP)
+        if nfe == 0 and nfse == 0:
+            messagebox.showinfo("Limpar Sessão", "A sessão já está vazia."); return
+        resp = messagebox.askyesno(
+            "Limpar Sessão",
+            f"Isso apagará os dados da sessão atual:\n\n"
+            f"  NF-e : {nfe} registro(s)\n"
+            f"  NFS-e: {nfse} registro(s)\n\n"
+            f"O histórico salvo (CSV/Excel principal) não será alterado.\n\n"
+            f"Deseja continuar?"
+        )
+        if not resp: return
+        from load.storage import _criar_csv_vazio
+        _criar_csv_vazio(cfg.CSV_TEMP,      cfg.CABECALHO_CSV)
+        _criar_csv_vazio(cfg.CSV_NFSE_TEMP, cfg.CABECALHO_NFSE)
+        self._c_nfe.configure(text="0")
+        self._c_nfse.configure(text="0")
+        self.log("Sessão limpa. NF-e e NFS-e zerados.", "warn")
+        # Fecha janelas abertas pois os dados foram zerados
+        if self._win_nfe  and self._win_nfe.winfo_exists():  self._win_nfe.destroy()
+        if self._win_nfse and self._win_nfse.winfo_exists(): self._win_nfse.destroy()
+        if self._win_dash and self._win_dash.winfo_exists(): self._win_dash.destroy()
+
     def _fechar(self):
         if self.processando:
             if not messagebox.askyesno("Atenção", "Processamento em andamento.\nFechar mesmo assim?"): return
-        self.log("Sincronizando antes de fechar…", "info")
-        sincronizar_com_principal(); sincronizar_nfse_com_principal()
-        atualizar_excel_principal(); atualizar_excel_nfse_principal()
+        tem_dados = total_registros(cfg.CSV_TEMP) > 0 or total_registros(cfg.CSV_NFSE_TEMP) > 0
+        if tem_dados:
+            resp = messagebox.askyesnocancel(
+                "Fechar",
+                "Você tem dados importados nesta sessão.\n\n"
+                "Deseja sincronizar (salvar no histórico) antes de fechar?\n\n"
+                "Sim → Sincroniza e fecha\n"
+                "Não → Fecha sem salvar no histórico\n"
+                "Cancelar → Volta ao sistema"
+            )
+            if resp is None: return          # Cancelar
+            if resp:                         # Sim → sincroniza
+                self.log("Sincronizando antes de fechar…", "info")
+                sincronizar_com_principal(); sincronizar_nfse_com_principal()
+                atualizar_excel_principal(); atualizar_excel_nfse_principal()
         limpar_temporarios()
         self.janela.destroy(); sys.exit(0)
 

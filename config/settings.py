@@ -85,6 +85,11 @@ CABECALHO_NFSE = [
     "Arquivo_Origem",
 ]
 
+# ── Modo de sessão ────────────────────────────────────────────────────────────
+# "acumular"   → cada sessão soma ao histórico (comportamento padrão anterior)
+# "substituir" → cada sessão começa do zero; o Excel/CSV principal é sobrescrito
+MODO_SESSAO = "substituir"
+
 LOCK_TTL_SECONDS = 300
 TEMP_TTL_SECONDS = 3600
 
