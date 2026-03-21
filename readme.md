@@ -13,7 +13,6 @@ Aplicação desktop para leitura em lote de XMLs de **Notas Fiscais Eletrônicas
   - **NFSe Nacional** — padrão SPED/Fazenda (MJOTA, LEXPLAN, Ruber, Stylus, Onfly novo...)
 - Extração de impostos por produto (NF-e): ICMS, IPI, PIS, COFINS, IBS/CBS
 - Extração de impostos por nota (NFS-e): ISS, PIS, COFINS, CSLL, IRRF, INSS, IBS/CBS
-- Planilha interativa com filtro, soma de seleção e exportação CSV
 - Dashboard com gráficos de barras e pizza (sem matplotlib)
 - Múltiplos usuários simultâneos via arquivos temporários isolados por sessão
 - Excel atualizado automaticamente após cada importação (dados da sessão atual)
@@ -42,7 +41,7 @@ XmlProcessor/
 │   └── storage.py             ← CSV/Excel temporário e principal, sincronização, backup
 │
 ├── ui/
-│   └── main_window.py         ← interface: sidebar, planilhas, dashboard, log
+│   └── main_window.py         ← interface: sidebar, dashboard, log
 │
 └── diagnostico.py             ← script de diagnóstico para resolução de problemas
 ```
@@ -118,7 +117,7 @@ XMLs selecionados
        │  temp → CSV principal (substitui ou acumula conforme MODO_SESSAO)
        │  CSV principal → Excel principal (regerado)
        │
-       ▼  planilha / dashboard
+       ▼  dashboard
           lê sempre o CSV mais recente (temp > principal)
 ```
 
